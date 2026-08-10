@@ -411,71 +411,120 @@ Ghi lại **một** lỗi bạn gặp khi deploy lên cloud (build fail, health 
 timeout, sai REDIS_URL, app không đọc `$PORT`...): thông báo lỗi là gì, bạn
 tìm ra nguyên nhân bằng cách nào, và sửa ra sao?
 
-Nói thẳng trước: tôi **chưa hoàn tất deploy lên cloud** (chi tiết và lý do ghi
-trong `DEPLOYMENT.md`), nên lỗi tôi kể dưới đây gặp ở bước deploy bằng
-`docker compose` trên máy, không phải trên Railway. Nhưng nó thuộc đúng nhóm
-lỗi mà câu hỏi nhắm tới — cấu hình cổng — nên tôi ghi lại nguyên văn.
+Tôi deploy lên **Railway** (project `day12-chat-2A202601650`, service `chat` +
+Redis add-on). Lần deploy đầu **thất bại ở bước health check dù build thành
+công** — đúng cái tình huống khó chịu nhất, vì log build toàn màu xanh.
 
-**Thông báo lỗi:**
+**Thông báo lỗi.** Trên màn hình deploy:
 
 ```
-Error response from daemon: driver failed programming external connectivity on
-endpoint k4-day12-...-chat-1: Bind for 0.0.0.0:8000 failed: port is already allocated
+====================
+Starting Healthcheck
+====================
+Path: /healthz
+Retry window: 30s
+
+Attempt #1 failed with service unavailable. Continuing to retry for 19s
+Attempt #2 failed with service unavailable. Continuing to retry for 8s
+Deploy failed
 ```
 
-**Cách tìm nguyên nhân.** Đọc kỹ thông báo: nó nói *bind* thất bại, không phải
-app crash — nghĩa là vấn đề ở lớp cổng của Docker, chưa tới lượt code của tôi.
-Tôi kiểm tra ai đang giữ cổng:
+**Cách tìm nguyên nhân.** "Service unavailable" chỉ nói *không ai trả lời cổng
+đó*, chứ không nói vì sao — nên tôi không đoán, tôi đi đọc log của container:
 
 ```bash
-$ lsof -nP -iTCP:8000 -sTCP:LISTEN
-com.docke 22030 ... TCP *:8000 (LISTEN)
-
-$ docker ps --format '{{.Names}} {{.Ports}}'
-p-184-backend-1   0.0.0.0:8000->8000/tcp
+$ railway logs --service chat --deployment
+Starting Container
+Usage: uvicorn [OPTIONS] APP
+Error: Invalid value for '--port': '$PORT' is not a valid integer.
+Error: Invalid value for '--port': '$PORT' is not a valid integer.
+Error: Invalid value for '--port': '$PORT' is not a valid integer.
 ```
 
-Một project khác của tôi đang chạy và đã chiếm `8000` của host. Không phải lỗi
-Dockerfile hay compose.
+Đọc được dòng này thì mọi thứ sáng ra ngay: uvicorn nhận `--port` với giá trị
+là **chuỗi 5 ký tự `$PORT`**, không phải số. Container khởi động, crash, được
+restart, crash lại — crash loop. Health check không bao giờ có ai trả lời, và
+sau 30 giây Railway bỏ cuộc.
 
-**Cách sửa.** Tôi không tắt project kia, mà làm cổng host thành tham số:
+Nguyên nhân nằm ở `railway.toml` mà lab cho sẵn:
 
-```yaml
-ports:
-  - "${CHAT_HOST_PORT:-8000}:8000"
+```toml
+startCommand = "uvicorn app.main:app --host 0.0.0.0 --port $PORT"
 ```
 
+Railway thực thi `startCommand` **không qua shell**. Không có shell thì không
+ai nội suy `$PORT`, nên nó được truyền nguyên văn như một argument. Điều đáng
+chú ý: `CMD` trong Dockerfile của tôi viết đúng
+(`sh -c "exec uvicorn ... --port ${PORT:-8000}"`), nhưng `startCommand` trong
+`railway.toml` **ghi đè** `CMD`, nên phần viết đúng đó không bao giờ được chạy.
+Tôi mất mấy phút mới nhận ra chỗ này, vì bản chạy `docker compose` ở máy — nơi
+`CMD` được dùng — hoạt động hoàn hảo.
+
+**Cách sửa.** Tự bọc shell trong `startCommand`:
+
+```toml
+startCommand = "sh -c 'exec uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}'"
+healthcheckTimeout = 120
+```
+
+Deploy lại → `Deploy complete`, rồi `railway domain --port 8000` cấp URL công
+khai. Kiểm tra thật qua Internet:
+
+```
+$ curl -i https://chat-production-620e.up.railway.app/healthz
+HTTP/2 200
+{"status":"ok","service":"day12-chat-service","version":"1.0.0"}
+
+$ curl -i https://chat-production-620e.up.railway.app/readyz
+HTTP/2 200
+{"status":"ready","redis":true}
+```
+
+`/readyz` trả `redis: true` là bằng chứng service nối được Redis add-on qua
+private network `redis.railway.internal` — tôi set `REDIS_URL` bằng service
+reference `${{Redis.REDIS_URL}}` nên giá trị thật không nằm ở đâu trong repo.
+
+**Ba điều tôi học được từ lỗi này:**
+
+1. **`sh -c` là bắt buộc nếu muốn nội suy biến môi trường trong lệnh khởi
+   động.** Exec form (`["uvicorn", "--port", "$PORT"]`) hay `startCommand`
+   không-qua-shell đều truyền `$PORT` nguyên văn. Đây là lý do tôi viết `CMD`
+   trong Dockerfile ở dạng shell form ngay từ đầu — chỉ là tôi không biết
+   `railway.toml` sẽ ghi đè nó.
+2. **`exec` để giữ PID 1.** Nếu chỉ viết `sh -c 'uvicorn ...'` thì `sh` là PID
+   1, và `sh` không chuyển SIGTERM xuống process con. Railway gửi SIGTERM mỗi
+   lần deploy bản mới; không nhận được thì toàn bộ phần graceful shutdown ở CP4
+   thành vô nghĩa và container luôn bị SIGKILL. Tôi kiểm tra lại bằng cách bấm
+   thời gian `docker stop` ở máy: container thoát sau **549 ms**, exit code 0,
+   và kịp ghi `{"event": "service_stopped", ...}`. Nếu SIGTERM không tới đúng
+   process, lệnh đó sẽ treo hết 30 giây `stop_grace_period` rồi mới bị giết.
+3. **Đọc log container, đừng đọc thông báo của orchestrator.**
+   "Service unavailable" là *triệu chứng* mà health check nhìn thấy từ bên
+   ngoài; nguyên nhân luôn nằm trong stdout của process. Toàn bộ chẩn đoán này
+   gói lại thành đúng một lệnh `railway logs`, và nó chỉ hữu ích vì app ghi log
+   ra stdout theo đúng cách CP1 yêu cầu.
+
+Một lỗi thứ hai nhỏ hơn, cùng họ với nó: cổng `8000` ở máy tôi đang bị một
+project khác chiếm, `docker compose up` báo
+`Bind for 0.0.0.0:8000 failed: port is already allocated`. Tôi không tắt
+project kia mà làm cổng host thành tham số: `"${CHAT_HOST_PORT:-8000}:8000"`,
 rồi đặt `CHAT_HOST_PORT=8001` trong `.env`. Mặc định vẫn là `8000:8000` cho
-người khác clone về; máy tôi thì dùng 8001. Cổng *bên trong* container không
-đổi, nên `REDIS_URL=redis://redis:6379/0`, healthcheck và nginx đều không phải
-sửa gì.
+người khác clone về. Cổng *bên trong* container không đổi, nên `REDIS_URL`,
+healthcheck và nginx không phải sửa gì. Bài học chung của cả hai lỗi: **cổng là
+thứ thuộc về môi trường, không thuộc về app** — đúng tinh thần 12-Factor, và
+cũng là lý do trên cloud tôi không được phép cố định cổng nào cả.
 
-**Điều tôi học được, và nó liên quan trực tiếp tới cloud.** Cổng host là thứ
-thuộc về *môi trường*, không thuộc về app — đúng tinh thần 12-Factor. Trên
-Railway/Render tôi không được chọn cổng: platform gán một cổng ngẫu nhiên qua
-biến `PORT` và app phải nghe theo. Đây là lý do trong Dockerfile tôi viết
-
-```dockerfile
-CMD ["sh", "-c", "exec uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
-```
-
-thay vì hardcode `--port 8000`. Ba chi tiết ở dòng này tôi phải suy nghĩ mới
-viết đúng:
-
-- dùng **shell form** (`sh -c`), vì exec form `["uvicorn", "--port", "$PORT"]`
-  truyền `$PORT` như chuỗi ký tự thật — không có shell nào nội suy nó;
-- `exec` để uvicorn thay thế `sh` và giữ **PID 1**; nếu không, `sh` là PID 1
-  và nó không chuyển SIGTERM xuống con, nên graceful shutdown ở CP4 mất tác
-  dụng và container luôn bị SIGKILL sau khi hết thời gian chờ;
-- `--host 0.0.0.0`, không phải `127.0.0.1`, nếu không cổng chỉ mở bên trong
-  network namespace của container và mọi health check từ bên ngoài đều timeout.
-
-Tôi kiểm tra lại điểm thứ hai bằng cách bấm thời gian một lần `docker stop`:
-container thoát sau **549 ms** với exit code 0 và ghi kịp dòng
-`{"event": "service_stopped", ...}`. Nếu SIGTERM không tới được uvicorn,
-`docker stop` sẽ treo hết 30 giây `stop_grace_period` rồi SIGKILL — và
-`--port 8000` hardcode thì trên Railway health check sẽ timeout mà log của app
-trông hoàn toàn bình thường, đúng kiểu lỗi mất cả buổi để tìm.
+Lỗi thứ ba, không liên quan tới code: khi thử phần điểm cộng nginx, Docker Hub
+trả `429 Too Many Requests` cho `nginx:1.27-alpine` — rate limit của registry
+với người dùng chưa đăng nhập. Tôi chuyển sang chứng minh tính stateless bằng
+cách khác: `--scale chat=3` rồi gọi `/chat` lần lượt vào từng container với cùng
+một `X-Client-Id`, và `turns_before` trả về `0 → 2 → 4 → 6 → 8 → 10` theo thứ
+tự chat-1, chat-2, chat-3, chat-1, chat-2, chat-3. Ba process khác nhau, ba
+vùng RAM khác nhau, nhưng cùng thấy một lịch sử hội thoại — vì lịch sử nằm
+trong Redis chứ không nằm trong process. Trên Railway tôi thấy lại đúng điều
+đó: gọi `/chat` hai lần với cùng `client_id` thì `turns_before` tăng từ 0 lên
+2, dù giữa hai lần đó Railway hoàn toàn có thể đã chuyển tôi sang một instance
+khác.
 
 Lỗi thứ hai đáng ghi lại: khi thử phần điểm cộng nginx, Docker Hub trả
 `429 Too Many Requests` cho `nginx:1.27-alpine`. Đây là rate limit của registry

@@ -1,14 +1,13 @@
 # Ảnh chụp bằng chứng chạy thật
 
-Bài này dùng **phương án dự phòng** (`LOCAL_FALLBACK=true`): stack chạy bằng
-`docker compose up -d` ở máy, chưa có Public URL trên cloud. Xem `DEPLOYMENT.md`.
+Service đã deploy lên Railway, Public URL:
+**https://chat-production-620e.up.railway.app** (xem `DEPLOYMENT.md`).
 
 | Ảnh | Nội dung |
 |-----|----------|
-| `compose-ps.png` | `docker compose ps` — cả `chat` và `redis` đều `healthy`; dung lượng image multi-stage (334MB); `id` trong container = `uid=10001(appuser)`, không phải root |
-| `healthz.png` | `/healthz` 200, `/readyz` 200 (`redis: true`), `/chat` 401 kèm `WWW-Authenticate: Bearer` khi thiếu token, `/chat` 200 khi có token, và 15 request liên tiếp cho ra `10× 200` rồi `5× 429` |
+| `railway-status.png` | Project `day12-chat-2A202601650` trên Railway: service `chat` **Online** kèm Public URL, service `Redis` (`redis:8.2.1`, volume 500MB) **Online**, domain `chat-production-620e.up.railway.app` → target port 8000, sync `ACTIVE` |
+| `healthz.png` | Gọi thật qua Internet vào Public URL: `/healthz` 200, `/readyz` 200 (`redis: true`), `/chat` 401 kèm `WWW-Authenticate: Bearer` khi thiếu token, `/chat` 200 khi có token, 15 request liên tiếp cho `10× 200` rồi `5× 429`, và header `retry-after` của response 429. Chú ý `HTTP/2` — Railway phục vụ qua TLS + HTTP/2 |
+| `compose-ps.png` | Bản chạy ở máy bằng `docker compose` (giữ lại làm bằng chứng CP2): image multi-stage 334MB, `id` trong container = `uid=10001(appuser)`, cả `chat` và `redis` đều `healthy` |
 
-Hai ảnh này được **render lại từ output thật** của các lệnh đã chạy lúc
-2026-08-10 (không phải ảnh chụp cửa sổ terminal). Nội dung là output nguyên
-văn. Sau khi deploy lên cloud thành công, nên thay bằng ảnh chụp dashboard
-của platform và ảnh gọi `/healthz` qua URL công khai.
+Các ảnh này được **render lại từ output nguyên văn** của những lệnh đã thật sự
+chạy lúc 2026-08-10, không phải ảnh chụp cửa sổ terminal hay dashboard.
