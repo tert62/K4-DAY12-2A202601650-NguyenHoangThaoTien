@@ -34,10 +34,56 @@ services:
       timeout: 3s
       retries: 5
 
-  # TODO (CP2): khai báo service `chat` ở đây
-  # chat:
-  #   build: .
-  #   ...
+  chat:
+    build: .
+    ports:
+      # Mặc định 8000:8000. Đặt CHAT_HOST_PORT trong .env nếu cổng 8000 của
+      # máy đang bị một project khác chiếm.
+      - "${CHAT_HOST_PORT:-8000}:8000"
+    environment:
+      # Nội suy từ file .env cùng thư mục — KHÔNG viết giá trị secret vào đây
+      API_TOKEN: ${API_TOKEN}
+      # Trong compose, tên service chính là hostname. `localhost` bên trong
+      # container là chính container đó, không phải Redis.
+      REDIS_URL: redis://redis:6379/0
+      PORT: 8000
+      BUCKET_CAPACITY: ${BUCKET_CAPACITY:-10}
+      REFILL_PER_MINUTE: ${REFILL_PER_MINUTE:-10}
+      DAILY_BUDGET_USD: ${DAILY_BUDGET_USD:-1.0}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - |
+          import sys, urllib.request
+          sys.exit(0 if urllib.request.urlopen("http://127.0.0.1:8000/healthz", timeout=3).status == 200 else 1)
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    # Cho uvicorn kịp xử lý nốt request đang chạy sau khi nhận SIGTERM
+    stop_grace_period: 30s
+    restart: unless-stopped
+
+  # ĐIỂM CỘNG — load balancer đứng trước nhiều instance `chat`.
+  # Chỉ chạy khi gọi tên profile, để `docker compose up -d` mặc định vẫn gọn:
+  #     docker compose --profile lb up -d --scale chat=3
+  # (nhớ bỏ mục `ports` của service `chat` khi scale, 3 container không thể
+  #  cùng chiếm cổng 8000 của host)
+  nginx:
+    image: nginx:1.27-alpine
+    profiles: ["lb"]
+    ports:
+      - "8080:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - chat
 
 volumes:
   redis-data:
