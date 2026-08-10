@@ -13,27 +13,49 @@ Trong `Settings`, `api_token` không có giá trị mặc định nên app chế
 khởi động nếu thiếu biến môi trường. Hãy mô tả một tình huống cụ thể mà việc
 "chết sớm" này cứu bạn, so với việc để mặc định `"changeme"`.
 
-Tình huống: tôi deploy lên Railway, tạo service từ Dockerfile, nhưng khi điền
-biến môi trường thì gõ sai tên — `API-TOKEN` thay vì `API_TOKEN`.
+Tôi không phải tưởng tượng tình huống này — **nó đã xảy ra thật với tôi khi
+deploy lên Render**, và tôi giữ lại log làm ví dụ.
 
-- **Có mặc định `"changeme"`**: container khởi động bình thường, `/healthz` trả
-  200, dashboard hiện màu xanh, tôi tick xong CP5 và đi làm việc khác. Service
-  lúc này nhận đúng một token duy nhất là chuỗi `changeme` — chuỗi mà mọi người
-  đọc source trên GitHub đều biết, và repo của tôi thì public. Bất kỳ ai cũng
-  gọi được `/chat`. Tôi chỉ phát hiện ra khi hóa đơn LLM tăng bất thường hoặc
-  khi cost guard bắt đầu trả 402 cho những `client_id` tôi chưa từng thấy —
-  tức là sau khi thiệt hại đã xảy ra rồi.
-- **Không có mặc định**: `Settings()` raise `ValidationError` ngay lúc import
-  `app.config`, uvicorn không lên được, container chết. Railway thấy health
-  check không bao giờ pass nên giữ lại bản cũ và đánh dấu deploy thất bại. Tôi
-  mở log, thấy đúng dòng `api_token Field required`, sửa tên biến, deploy lại.
-  Tổng thiệt hại: 2 phút, và không có một giây nào service chạy ở trạng thái
-  không an toàn.
+Render đọc `render.yaml`, tạo web service + Key Value, deploy `Live`, dashboard
+xanh. Nhưng `API_TOKEN` được khai `sync: false` (Render hỏi giá trị lúc apply
+Blueprint thay vì lưu vào repo) và ô đó không được lưu giá trị. Kết quả:
 
-Điểm cốt lõi: sai cấu hình là chuyện sẽ xảy ra, không phải chuyện có thể xảy
-ra. Câu hỏi duy nhất là nó biểu hiện thành *một lỗi ồn ào lúc khởi động* hay
-*một lỗ hổng im lặng lúc đang chạy*. Giá trị mặc định cho secret chính là thứ
-biến trường hợp đầu thành trường hợp sau.
+```
+pydantic_core.ValidationError: 1 validation error for Settings
+api_token
+  Field required [type=missing, input_value={'port': '10000', 'redis_...0', 'log_level': 'INFO'}]
+```
+
+Đọc env var qua Render API xác nhận service chỉ có 5 biến, `API_TOKEN` không
+tồn tại. Sửa bằng `PUT /v1/services/{id}/env-vars/API_TOKEN` rồi redeploy.
+
+So sánh hai kịch bản trên đúng sự cố đó:
+
+- **Không có mặc định (thực tế đã xảy ra)**: `Settings()` raise ngay lần đầu có
+  ai gọi tới nó. `/readyz` và `/chat` trả 500, tôi mở log và thấy đúng một dòng
+  `api_token Field required` — không phải đoán. Thời gian từ lúc thấy lỗi tới
+  lúc sửa xong: khoảng 5 phút. Và quan trọng nhất: **không có một giây nào**
+  service phục vụ `/chat` ở trạng thái không an toàn.
+- **Nếu tôi để mặc định `"changeme"`**: mọi thứ sẽ xanh. `/healthz` 200,
+  `/readyz` 200, `/chat` trả lời bình thường, dashboard không có một dấu hiệu
+  gì. Tôi tick xong CP5 và đi làm việc khác. Nhưng service lúc đó nhận đúng một
+  token duy nhất là chuỗi `changeme` — chuỗi nằm trong `config.py` của một repo
+  **public**. Bất kỳ ai đọc source cũng gọi được `/chat`, và tôi chỉ phát hiện
+  khi cost guard bắt đầu trả 402 cho những `client_id` tôi chưa từng thấy, tức
+  là sau khi tiền đã mất.
+
+Một chi tiết tôi chỉ hiểu sau khi gặp lỗi thật: **hình dạng của lỗi cũng nói
+đúng thiết kế**. `/healthz` vẫn trả 200 trong suốt thời gian đó, vì nó không
+gọi `get_settings()` — đúng yêu cầu "probe phải nhẹ" của CP1. `/chat` không có
+token vẫn trả 401, vì `verify_bearer_token` chặn ở dòng đầu trước khi đọc
+settings. Chỉ những đường đi thật sự cần secret mới vỡ. Nếu tôi đặt
+`get_settings()` ở module level thì cả `/healthz` cũng chết theo, và
+orchestrator sẽ restart container vô hạn thay vì để tôi vào đọc log.
+
+Điểm cốt lõi: sai cấu hình là chuyện *sẽ* xảy ra, không phải *có thể* xảy ra —
+tôi vừa tự chứng minh điều đó. Câu hỏi duy nhất là nó biểu hiện thành *một lỗi
+ồn ào, có địa chỉ rõ ràng* hay *một lỗ hổng im lặng*. Giá trị mặc định cho
+secret chính là thứ biến trường hợp đầu thành trường hợp sau.
 
 ---
 
@@ -411,9 +433,16 @@ Ghi lại **một** lỗi bạn gặp khi deploy lên cloud (build fail, health 
 timeout, sai REDIS_URL, app không đọc `$PORT`...): thông báo lỗi là gì, bạn
 tìm ra nguyên nhân bằng cách nào, và sửa ra sao?
 
-Tôi deploy lên **Railway** (project `day12-chat-2A202601650`, service `chat` +
-Redis add-on). Lần deploy đầu **thất bại ở bước health check dù build thành
-công** — đúng cái tình huống khó chịu nhất, vì log build toàn màu xanh.
+Tôi deploy hai lần trên hai platform: **Railway** trước, rồi chuyển sang
+**Render** (bản nộp cuối cùng: https://day12-chat-7erl.onrender.com). Cả hai
+lần đều fail ở lần đầu, và cả hai lỗi đều **bắt đầu bằng một build màu xanh** —
+đó là điểm chung đáng ghi nhớ nhất. Lỗi Render tôi đã kể ở câu 1 (thiếu
+`API_TOKEN` → fail fast); dưới đây là lỗi Railway, vì nó thuộc đúng nhóm mà câu
+hỏi này nhắm tới.
+
+Railway: project `day12-chat-2A202601650`, service `chat` + Redis add-on. Lần
+deploy đầu **thất bại ở bước health check dù build thành công** — đúng cái tình
+huống khó chịu nhất, vì không có gì trong log build gợi ý nguyên nhân.
 
 **Thông báo lỗi.** Trên màn hình deploy:
 
@@ -484,6 +513,14 @@ HTTP/2 200
 private network `redis.railway.internal` — tôi set `REDIS_URL` bằng service
 reference `${{Redis.REDIS_URL}}` nên giá trị thật không nằm ở đâu trong repo.
 
+(Bản Railway này sau đó tôi **xóa** để không tiêu credit dùng thử, nên URL trên
+giờ trả 404. Bản nộp cuối cùng chạy trên Render free — xem `DEPLOYMENT.md`. Điều
+thú vị là trên Render, cùng vấn đề `$PORT` **không xảy ra**: `render.yaml` không
+khai `startCommand` nào, nên Render dùng đúng `CMD` của Dockerfile — vốn đã bọc
+`sh -c` sẵn — và Render tự inject `PORT=10000`. Cùng một image, cùng một
+Dockerfile, chạy đúng trên platform này và sai trên platform kia, chỉ vì một
+dòng cấu hình riêng của platform ghi đè `CMD`.)
+
 **Ba điều tôi học được từ lỗi này:**
 
 1. **`sh -c` là bắt buộc nếu muốn nội suy biến môi trường trong lệnh khởi
@@ -521,19 +558,14 @@ cách khác: `--scale chat=3` rồi gọi `/chat` lần lượt vào từng cont
 một `X-Client-Id`, và `turns_before` trả về `0 → 2 → 4 → 6 → 8 → 10` theo thứ
 tự chat-1, chat-2, chat-3, chat-1, chat-2, chat-3. Ba process khác nhau, ba
 vùng RAM khác nhau, nhưng cùng thấy một lịch sử hội thoại — vì lịch sử nằm
-trong Redis chứ không nằm trong process. Trên Railway tôi thấy lại đúng điều
-đó: gọi `/chat` hai lần với cùng `client_id` thì `turns_before` tăng từ 0 lên
-2, dù giữa hai lần đó Railway hoàn toàn có thể đã chuyển tôi sang một instance
-khác.
+trong Redis chứ không nằm trong process. Đó là bằng chứng trực tiếp cho điều
+CP4 nói.
 
-Lỗi thứ hai đáng ghi lại: khi thử phần điểm cộng nginx, Docker Hub trả
-`429 Too Many Requests` cho `nginx:1.27-alpine`. Đây là rate limit của registry
-với người dùng chưa đăng nhập, không phải lỗi cấu hình. Tôi chuyển sang chứng
-minh tính stateless bằng cách khác: `--scale chat=3` rồi gọi `/chat` lần lượt
-vào từng container với cùng một `X-Client-Id`, và `turns_before` trả về
-`0 → 2 → 4 → 6 → 8 → 10` theo thứ tự chat-1, chat-2, chat-3, chat-1, chat-2,
-chat-3. Ba process khác nhau, ba vùng RAM khác nhau, nhưng cùng thấy một lịch
-sử hội thoại — vì lịch sử nằm trong Redis chứ không nằm trong process. Đó là
-bằng chứng trực tiếp cho điều CP4 nói, và cũng cho thấy: trên cloud, nơi
-platform tự scale và tự restart container bất cứ lúc nào, một `dict` trong RAM
-sẽ hỏng theo cách rất khó tái hiện.
+Trên cloud tôi thấy lại đúng điều đó, và lần này không cần dàn dựng gì: gọi
+`/chat` nhiều lần với cùng `X-Client-Id: sv-render` trên Render, `turns_before`
+tăng dần `0 → 2 → 4`, dù giữa các lần gọi đó service đã bị **tạo lại ba lần**
+(hai lần redeploy để sửa `API_TOKEN`, một lần Render tự ngủ rồi thức). Nếu lịch
+sử nằm trong một `dict` trong RAM thì mỗi lần container mới lên là mất trắng, và
+lỗi đó sẽ biểu hiện thành "service thỉnh thoảng mất trí nhớ" — kiểu bug rất khó
+tái hiện, vì nó phụ thuộc vào việc platform có tình cờ restart container giữa
+hai request của người dùng hay không.
