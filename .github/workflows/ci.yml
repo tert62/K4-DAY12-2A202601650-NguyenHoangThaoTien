@@ -1,0 +1,146 @@
+name: CI
+
+# Chạy cả khi push và khi mở pull request. `pull_request` mới là phần quan
+# trọng: bắt lỗi TRƯỚC khi merge, chứ không phải sau.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Push liên tiếp thì hủy lần chạy cũ, khỏi xếp hàng tốn runner
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── 1. Test ──────────────────────────────────────────────────────
+  test:
+    name: Test (pytest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Cài dependency
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Chạy test
+        # Bỏ test_cp5.py: nó gọi vào bản deploy đang sống, chạy trong CI luôn đỏ.
+        # Bỏ test_bonus_cicd.py: nó đọc badge trên GitHub, mà badge chỉ xanh SAU
+        # khi lần chạy này xong → tự khóa lẫn nhau.
+        # Bỏ mark docker: job `build` bên dưới đã build image thật rồi.
+        run: pytest tests/ -v --ignore=tests/test_cp5.py --ignore=tests/test_bonus_cicd.py -m "not docker"
+
+  # ── 2. Build image ───────────────────────────────────────────────
+  build:
+    name: Build Docker image
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        run: docker build -t day12-chat:${{ github.sha }} .
+
+      - name: Kiểm tra image đạt chuẩn production
+        run: |
+          set -euo pipefail
+          IMAGE=day12-chat:${{ github.sha }}
+
+          # Dưới 400MB
+          BYTES=$(docker image inspect "$IMAGE" --format '{{.Size}}')
+          MB=$((BYTES / 1024 / 1024))
+          echo "Image size: ${MB}MB"
+          test "$MB" -lt 400 || { echo "::error::image ${MB}MB, cần dưới 400MB"; exit 1; }
+
+          # Không chạy bằng root
+          USER_ID=$(docker run --rm --entrypoint sh "$IMAGE" -c 'id -u')
+          echo "Runtime uid: $USER_ID"
+          test "$USER_ID" != "0" || { echo "::error::container đang chạy bằng root"; exit 1; }
+
+      - name: Smoke test container vừa build
+        env:
+          # Token dùng một lần cho smoke test, sinh ngay trong runner —
+          # không phải secret thật của service
+          SMOKE_TOKEN: ${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          docker run -d --name smoke \
+            -e API_TOKEN="$SMOKE_TOKEN" \
+            -e REDIS_URL="fake://" \
+            -p 8000:8000 \
+            day12-chat:${{ github.sha }}
+
+          for i in $(seq 1 20); do
+            if curl -fsS http://localhost:8000/healthz > /dev/null; then break; fi
+            sleep 2
+          done
+
+          curl -fsS http://localhost:8000/healthz | tee /dev/stderr | grep -q '"status":"ok"'
+
+          CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://localhost:8000/chat \
+            -H 'Content-Type: application/json' -d '{"message":"ci"}')
+          test "$CODE" = "401" || { echo "::error::/chat không có token phải trả 401, đang trả $CODE"; exit 1; }
+
+          CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://localhost:8000/chat \
+            -H 'Content-Type: application/json' \
+            -H "Authorization: Bearer $SMOKE_TOKEN" \
+            -H 'X-Client-Id: ci' -d '{"message":"ci"}')
+          test "$CODE" = "200" || { echo "::error::/chat có token phải trả 200, đang trả $CODE"; exit 1; }
+
+          docker logs smoke
+          docker rm -f smoke
+
+  # ── 3. Deploy ────────────────────────────────────────────────────
+  deploy:
+    name: Deploy
+    needs: [test, build]
+    # `needs` là thứ biến workflow thành cổng chất lượng: test đỏ thì không
+    # bao giờ tới được bước này. `if` chặn deploy khi chỉ mở pull request.
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Kiểm tra đã cấu hình secret deploy chưa
+        id: guard
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+        run: |
+          if [ -z "${RAILWAY_TOKEN:-}" ]; then
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Chưa có secret RAILWAY_TOKEN (Settings → Secrets and variables → Actions) → bỏ qua deploy, không làm CI đỏ."
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Deploy lên Railway
+        if: steps.guard.outputs.configured == 'true'
+        env:
+          # Giá trị nằm trong GitHub Secrets, file này chỉ tham chiếu tới tên
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+        run: |
+          npm install -g @railway/cli@3
+          railway up --service "${{ vars.RAILWAY_SERVICE || 'chat' }}" --detach
+
+      - name: Smoke test bản vừa lên production
+        if: steps.guard.outputs.configured == 'true' && vars.DEPLOY_URL != ''
+        env:
+          DEPLOY_URL: ${{ vars.DEPLOY_URL }}
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 30); do
+            if curl -fsS "$DEPLOY_URL/healthz" > /dev/null; then break; fi
+            sleep 5
+          done
+          curl -fsS "$DEPLOY_URL/healthz" | grep -q '"status":"ok"'
+          curl -fsS "$DEPLOY_URL/readyz"  | grep -q '"status":"ready"'
