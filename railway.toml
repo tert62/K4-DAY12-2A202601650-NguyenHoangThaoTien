@@ -10,8 +10,14 @@ builder = "dockerfile"
 dockerfilePath = "Dockerfile"
 
 [deploy]
-startCommand = "uvicorn app.main:app --host 0.0.0.0 --port $PORT"
+# Railway chạy startCommand KHÔNG qua shell, nên "--port $PORT" được truyền
+# nguyên văn và uvicorn báo: Invalid value for '--port': '$PORT' is not a valid
+# integer. Phải tự bọc `sh -c` để có shell nội suy biến, và `exec` để uvicorn
+# thay thế shell, giữ PID 1 → SIGTERM của Railway tới đúng process khi deploy
+# bản mới (graceful shutdown ở CP4 mới có tác dụng).
+startCommand = "sh -c 'exec uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}'"
 healthcheckPath = "/healthz"
-healthcheckTimeout = 30
+# 30s không đủ cho lần khởi động lạnh đầu tiên trên free tier
+healthcheckTimeout = 120
 restartPolicyType = "on_failure"
 restartPolicyMaxRetries = 3
